@@ -1,17 +1,20 @@
 #!/bin/sh
-# send.sh —— KUAL 里点了某本书之后执行：发送 + 全屏结果提示 + 写日志
+# send.sh —— KUAL 里点了某本书之后执行：发送 + 屏幕结果提示 + 写日志
 # 用法：sh /mnt/us/extensions/SendToKindle/bin/send.sh "/mnt/us/documents/xxx.epub"
 #
-# 反馈机制（两层，保证看得见）：
-#   1) eips 全屏白底大字 —— 已在真机验证可用（左上角的 Sending ... 就是它画的）
-#   2) lipc-set-prop com.lab126.pillow pillowAlert 系统弹窗 —— 部分机型不出，仍保留
-# eips 画不出中文（默认字体无 CJK），所以屏幕大字用 ASCII，弹窗用中文。
+# 规则：
+#   < 50 MB  → 直接调用 send_to_kindle 发送
+#   > 50 MB  → 不发送，只把路径写进 /tmp/stk_pending.txt，
+#              并在菜单里生成「确认发送名片 / 取消发送」两项（由 scan.sh 读取）
+#
+# 屏幕反馈用 FBInk 的 -M（垂直居中）+ -m（水平居中）+ -p（补底色），不清屏、不退出 KUAL。
 
 PLUGIN_DIR="/mnt/us/extensions/SendToKindle"
 BIN="$PLUGIN_DIR/send_to_kindle"
 CONFIG="$PLUGIN_DIR/config.ini"
 LOG="$PLUGIN_DIR/send.log"
 OUT="/tmp/stk_send_out.txt"
+PENDING="/tmp/stk_pending.txt"
 
 # ---------------------------------------------------------------- 工具函数
 
@@ -120,6 +123,17 @@ bytes=$(wc -c < "$target" 2>/dev/null)
 bytes=$(( ${bytes:-0} + 0 ))
 mb=$(( bytes / 1048576 ))
 
+# > 50 MB：不自作主张发，写进 pending，让用户回 KUAL 二次确认
+if [ "$bytes" -gt 52428800 ]; then
+    printf '%s\n' "$target" > "$PENDING"
+    log "pending (big file): $target (${mb} MB)"
+    draw_card "FILE > 50MB" "reopen KUAL to confirm" "will send a preview card"
+    echo "⚠️  文件超过 50 MB，已登记为待确认：$target"
+    echo "   退回 KUAL 后会多出「确认发送名片 / 取消发送」两项。"
+    sh "$PLUGIN_DIR/bin/scan.sh" -q >/dev/null 2>&1
+    exit 0
+fi
+
 status "Sending ... ($mb MB)"
 log "---- send start: $target (${mb} MB)"
 
@@ -133,11 +147,7 @@ log "---- send end: rc=$rc"
 if [ "$rc" -eq 0 ]; then
     printf '%s\n' "$target" > "$PLUGIN_DIR/last.txt"
     log "success: $target"
-    if [ "$bytes" -gt 52428800 ]; then
-        report "SENT (TXT ONLY)" "已发送说明文件" "原文件超过 50 MB，只推送了说明 TXT" "file > 50MB" "notice txt sent"
-    else
-        report "SEND OK" "发送成功" "已推送到 Kindle 邮箱，几分钟后自动同步" "check kindle mailbox" "log: SendToKindle"
-    fi
+    report "SEND OK" "发送成功" "已推送到 Kindle 邮箱，几分钟后自动同步" "check kindle mailbox" "log: SendToKindle"
 else
     log "failed: $target rc=$rc"
     case "$rc" in
