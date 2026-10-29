@@ -1,26 +1,56 @@
 name: build-send_to_kindle
 
+# 在 GitHub 上交叉编译 Kindle 用的静态二进制（本地没装 Go 也能出包）
 on:
   workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ['v*']
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: arm
+            goarm: "7"
+            name: armv7
+          - goarch: arm
+            goarm: "6"
+            name: armv6
+          - goarch: arm64
+            goarm: ""
+            name: aarch64
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: "1.22"
+          cache: false
 
-      - name: Build
+      - name: 代码检查
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -ldflags="-s -w" -o send_to_kindle-armv7 main.go
+          gofmt -l . | tee /tmp/fmt.txt
+          test ! -s /tmp/fmt.txt
+          go vet ./...
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - name: 编译 ${{ matrix.name }}
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          mkdir -p out
+          go build -trimpath -ldflags="-s -w" -o out/send_to_kindle-${{ matrix.name }} .
+          file out/send_to_kindle-${{ matrix.name }} || true
+          ls -lh out/
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: send_to_kindle-armv7
-          path: send_to_kindle-armv7
+          name: send_to_kindle-${{ matrix.name }}
+          path: out/send_to_kindle-${{ matrix.name }}
+          if-no-files-found: error
