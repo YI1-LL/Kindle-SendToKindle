@@ -1,41 +1,27 @@
 #!/bin/sh
-# send.sh —— KUAL 里点了某本书之后执行：发送 + 屏幕结果提示 + 写日志
-# 用法：sh /mnt/us/extensions/SendToKindle/bin/send.sh "/mnt/us/documents/xxx.epub"
+# bin/send.sh - SendToKindle v1.5.0
+# 用法: send.sh <file> [--force]
 #
-# 规则：
-#   < 50 MB  → 直接调用 send_to_kindle 发送
-#   > 50 MB  → 不发送，只把路径写进 /tmp/stk_pending.txt，
-#              并在菜单里生成「确认发送名片 / 取消发送」两项（由 scan.sh 读取）
+# 行为：
+#   < 50MB          → 直接调用 send_to_kindle 发送
+#   > 50MB 无 --force → 只写 $DIR/pending，提示回 KUAL 确认（不发信）
+#   有 --force       → 跳过 50MB 拦截（confirm.sh 用）
 #
-# 屏幕反馈用 FBInk 的 -M（垂直居中）+ -m（水平居中）+ -p（补底色），不清屏、不退出 KUAL。
+# 屏幕：FBInk 三行居中（-qpmM -y 0），不清屏、不退出 KUAL。这是 v1.3 在 KPW6 上验证过的写法，
+#       绝不用 fbink -t "$T" / -B 1（那是 TrueType 字体参数，会静默失败变白屏）。
 
-PLUGIN_DIR="/mnt/us/extensions/SendToKindle"
-BIN="$PLUGIN_DIR/send_to_kindle"
-CONFIG="$PLUGIN_DIR/config.ini"
-LOG="$PLUGIN_DIR/send.log"
-OUT="/tmp/stk_send_out.txt"
-PENDING="/tmp/stk_pending.txt"
+DIR=$(cd "$(dirname "$0")/.." && pwd)
+LOG="$DIR/send.log"
+PENDING="$DIR/pending"
+LAST="$DIR/last.txt"
+CONFIG="$DIR/config.ini"
+MAX=52428800
 
-# ---------------------------------------------------------------- 工具函数
+# 二进制：优先插件根目录，其次 bin/（两种放法都能跑）
+BIN="$DIR/send_to_kindle"
+[ -f "$BIN" ] || BIN="$DIR/bin/send_to_kindle"
 
-json_escape() {
-    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n'
-}
-
-make_alert() {
-    t=$(json_escape "$1")
-    x=$(json_escape "$2")
-    printf '%s' '{"clientParams":{"alertId":"stkAlert","show":true,"customStrings":[{"matchStr":"alertTitle","replaceStr":"'"$t"'"},{"matchStr":"alertText","replaceStr":"'"$x"'"}]}}'
-}
-
-# ---------------------------------------------------------------- 屏幕输出
-# KPW6 上的坑（实测过）：
-#   * eips 在这代固件是废弃的兼容层，连续多次调用只有最后一次生效 → 只能显示一行
-#   * 固定行号（-y 4）遇到换行就会顶出屏幕，而且 -c 清屏会把整个界面刷白
-#   * 后台延时重绘会被 KUAL 杀掉，停在"清屏之后"→ 全白
-# 现在的做法（自适应、不清屏、不重叠）：
-#   -M 垂直居中（整块永远在屏幕内，不管几行）、-m 水平居中、-p 每行补底色
-#   不加 -c，所以界面保持原样，只是中间盖一块结果
+# ---------------------------------------------------------------- fbink
 FBINK=""
 for d in /var/tmp /mnt/us/libkh/bin /mnt/us/koreader /mnt/us/linkss/bin /mnt/us/linkfonts/bin /mnt/us/usbnet/bin /usr/bin /usr/local/bin; do
     if [ -x "$d/fbink" ]; then
@@ -52,112 +38,145 @@ for c in /usr/sbin/eips /usr/bin/eips /bin/eips /sbin/eips; do
     fi
 done
 
-# 结果卡片（ASCII，每行 ≤ 28 字符，不会触发换行）
-#   $1 = 主标题   $2 = 副标题   $3 = 第三行
-draw_card() {
-    if [ -n "$FBINK" ]; then
-        "$FBINK" -qpmM -y 0 "$1
+# 三行结果卡：$1 主标题  $2 副标题  $3 第三行（可为空）
+show_msg() {
+    [ -n "$FBINK" ] || {
+        if [ -n "$EIPS" ]; then
+            "$EIPS" 8 3 "$1" >/dev/null 2>&1
+        fi
+        return 0
+    }
+    "$FBINK" -qpmM -y 0 "$1
 $2
 $3" >/dev/null 2>&1
-        rc=$?
-        log "fbink rc=$rc"
-        if [ "$rc" -ne 0 ]; then
-            "$FBINK" -qpm -y -5 "$1" >/dev/null 2>&1
-        fi
-    elif [ -n "$EIPS" ]; then
-        "$EIPS" 8 3 "$1" >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        # 个别 FBInk 不认 -M 时退化为底部一行
+        "$FBINK" -qpm -y -5 "$1" >/dev/null 2>&1
     fi
 }
 
-# 结果提示：屏幕卡片 + 尝试系统弹窗（只画一次，不留后台进程）
-report() {
-    json=$(make_alert "$2" "$3")
-    lipc-set-prop com.lab126.pillow pillowAlert "$json" 2>/dev/null
-    draw_card "$1" "$4" "$5"
-}
-
-status() {
-    if [ -n "$EIPS" ]; then
-        "$EIPS" 1 1 "$1" >/dev/null 2>&1
+# ---------------------------------------------------------------- 日志（>500 行截断到 200 行）
+write_log() {
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG" 2>/dev/null
+    _l=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')
+    case "$_l" in ''|*[!0-9]*) return ;; esac
+    if [ "$_l" -gt 500 ]; then
+        tail -n 200 "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
+        echo "--- log trimmed ---" >> "$LOG"
     fi
 }
 
-log() {
-    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null
+# ---------------------------------------------------------------- 文件大小（老机型兼容）
+get_file_size() {
+    _f="$1"
+    if stat -c %s "$_f" >/dev/null 2>&1; then
+        stat -c %s "$_f" 2>/dev/null | head -n 1
+    elif stat -f %z "$_f" >/dev/null 2>&1; then
+        stat -f %z "$_f" 2>/dev/null | head -n 1
+    elif wc -c < "$_f" >/dev/null 2>&1; then
+        wc -c < "$_f" | tr -d ' '
+    else
+        echo 0
+    fi
 }
 
-# ---------------------------------------------------------------- 前置检查
+# ---------------------------------------------------------------- 网络自检
+# 返回：0 通 / 1 不通 / 2 无法判断（工具不支持，放行）
+net_ok() {
+    if command -v ping >/dev/null 2>&1; then
+        ping -c 1 -W 2 "$1" >/dev/null 2>&1
+        _rc=$?
+        [ "$_rc" -eq 0 ] && return 0
+        ping -c 1 -w 2 "$1" >/dev/null 2>&1
+        _rc2=$?
+        [ "$_rc2" -eq 0 ] && return 0
+    else
+        _rc=2
+        _rc2=2
+    fi
 
-target="$1"
+    # ping 不通时，再用 TCP 探一次（有些路由屏蔽 ICMP）
+    if command -v nc >/dev/null 2>&1; then
+        nc -w 3 "$1" 465 </dev/null >/dev/null 2>&1 && return 0
+        return 1
+    fi
 
-if [ -z "$target" ]; then
-    echo "❌ 没有指定文件"
-    report "NO FILE GIVEN" "缺少参数" "没有指定文件" "no file given" "run in kterm"
-    exit 1
-fi
+    # ping 完全没有/选项不支持 → 不拦，让发送自己去报错
+    if [ "$_rc" -ge 2 ] || [ "$_rc2" -ge 2 ]; then
+        return 2
+    fi
+    return 1
+}
 
-if [ ! -f "$target" ]; then
-    echo "❌ 文件不存在: $target"
-    log "missing: $target"
-    report "FILE NOT FOUND" "文件不存在" "选中的文件已被删除或移动" "file not found" "check documents"
+# ================================================================ 主流程
+FILE="$1"
+FORCE="$2"
+
+if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+    show_msg "[ !! ] FAILED!" "File not found" ""
+    write_log "FAILED file not found: ${FILE:-<empty>}"
     exit 1
 fi
 
 if [ ! -f "$BIN" ]; then
-    echo "❌ 找不到 $BIN"
-    log "binary missing"
-    report "NO BINARY" "缺少程序" "缺少 send_to_kindle" "binary missing" "re-copy it"
+    show_msg "[ !! ] FAILED!" "Binary missing" ""
+    write_log "FAILED binary missing: $BIN"
     exit 1
 fi
 
 if [ ! -f "$CONFIG" ]; then
-    echo "❌ 找不到 $CONFIG"
-    log "config missing"
-    report "NO CONFIG" "缺少配置" "缺少 config.ini" "config.ini missing" "re-copy it"
+    show_msg "[ !! ] FAILED!" "config.ini missing" ""
+    write_log "FAILED config missing: $CONFIG"
     exit 1
 fi
 
-# ---------------------------------------------------------------- 发送
+# 网络自检
+net_ok smtp.qq.com
+_net=$?
+if [ "$_net" -eq 1 ]; then
+    show_msg "[ !! ] NO WIFI" "Check connection" ""
+    write_log "NO WIFI: $FILE"
+    exit 1
+fi
 
-bytes=$(wc -c < "$target" 2>/dev/null)
-bytes=$(( ${bytes:-0} + 0 ))
-mb=$(( bytes / 1048576 ))
+# 大文件拦截
+SIZE=$(get_file_size "$FILE")
+case "$SIZE" in ''|*[!0-9]*) SIZE=0 ;; esac
 
-# > 50 MB：不自作主张发，写进 pending，让用户回 KUAL 二次确认
-if [ "$bytes" -gt 52428800 ]; then
-    printf '%s\n' "$target" > "$PENDING"
-    log "pending (big file): $target (${mb} MB)"
-    draw_card "FILE > 50MB" "reopen KUAL to confirm" "will send a preview card"
-    echo "⚠️  文件超过 50 MB，已登记为待确认：$target"
-    echo "   退回 KUAL 后会多出「确认发送名片 / 取消发送」两项。"
-    sh "$PLUGIN_DIR/bin/scan.sh" -q >/dev/null 2>&1
+if [ "$FORCE" != "--force" ] && [ "$SIZE" -gt "$MAX" ]; then
+    printf '%s\n' "$FILE" > "$PENDING"
+    show_msg "[ ?? ] > 50MB" "Reopen KUAL to confirm" ""
+    write_log "PENDING large file: $FILE ($SIZE bytes)"
+    sh "$DIR/bin/scan.sh" -q >/dev/null 2>&1
     exit 0
 fi
 
-status "Sending ... ($mb MB)"
-log "---- send start: $target (${mb} MB)"
+# 发送
+show_msg "[ > > ] SENDING..." "Please wait." ""
+write_log "SEND start: $FILE ($SIZE bytes)"
 
-"$BIN" -config "$CONFIG" -file "$target" > "$OUT" 2>&1
-rc=$?
+cd "$DIR" || exit 1
+OUT=$("$BIN" -config "$CONFIG" -file "$FILE" 2>&1)
+RC=$?
 
-cat "$OUT"
-cat "$OUT" >> "$LOG"
-log "---- send end: rc=$rc"
+LASTLINE=$(printf '%s\n' "$OUT" | tail -n 1)
+write_log "RC=$RC | $LASTLINE"
 
-if [ "$rc" -eq 0 ]; then
-    printf '%s\n' "$target" > "$PLUGIN_DIR/last.txt"
-    log "success: $target"
-    report "SEND OK" "发送成功" "已推送到 Kindle 邮箱，几分钟后自动同步" "check kindle mailbox" "log: SendToKindle"
-else
-    log "failed: $target rc=$rc"
-    case "$rc" in
-        2) reason="SMTP 认证失败：授权码失效或命中风控，详见 send.log" ;;
-        *) reason="发送失败，详见 send.log" ;;
+if [ "$RC" -ne 0 ]; then
+    case "$LASTLINE" in
+        *535*) show_msg "[ !! ] FAILED!" "Error: 535 Auth" "" ;;
+        *550*) show_msg "[ !! ] FAILED!" "Error: 550 Mailbox" "" ;;
+        *)     show_msg "[ !! ] FAILED!" "Check send.log" "" ;;
     esac
-    report "SEND FAILED" "发送失败" "$reason" "rc=$rc  see send.log" "log: SendToKindle"
+    sh "$DIR/bin/scan.sh" -q >/dev/null 2>&1
+    exit 1
 fi
 
-# 重建菜单（成功后出现 [2] 删除上次发送）；-q 静默
-sh "$PLUGIN_DIR/bin/scan.sh" -q >/dev/null 2>&1
+# 成功：清 pending、记 last、提示（不跳转、不 sleep）
+rm -f "$PENDING"
+printf '%s\n' "$FILE" > "$LAST"
+show_msg "[ OK ] SENT!" "Check your mailbox." ""
+write_log "SENT: $FILE"
 
-exit $rc
+sh "$DIR/bin/scan.sh" -q >/dev/null 2>&1
+exit 0

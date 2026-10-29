@@ -13,6 +13,7 @@ package main
 import (
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -37,7 +38,7 @@ import (
 )
 
 const (
-	appVersion    = "1.3.0"
+	appVersion    = "1.5.0"
 	maxAttachSize = 50 << 20 // 亚马逊个人文档附件上限 50 MB
 	dialTimeout   = 30 * time.Second
 	sessionExpire = 15 * time.Minute
@@ -47,6 +48,10 @@ const (
 
 	excerptRunes = 1000 // 试读字数
 	maxEntryRead = 4 << 20
+
+	// config.ini 自动恢复/备份
+	configBackupSuffix = ".bak"                 // config.ini -> config.ini.bak
+	templateMarker     = "your_email@qq.com"    // 配置里出现它就说明还是模板
 )
 
 // ---------------------------------------------------------------- 配置
@@ -61,6 +66,61 @@ type config struct {
 	from     string
 	insecure bool
 	caFile   string
+}
+
+// resolveConfig 在读取配置前做自动恢复：
+//  1) config.ini 存在但内容是模板（含 your_email@qq.com），且有 config.ini.bak → 用 bak 覆盖
+//  2) config.ini 不存在但 config.ini.bak 存在 → 用 bak 恢复
+//
+// 这样「覆盖插件时误把模板 config.ini 一起拷回去」也能自愈。
+func resolveConfig(cfgPath string) {
+	backup := cfgPath + configBackupSuffix
+
+	data, err := os.ReadFile(cfgPath)
+	if err == nil {
+		if strings.Contains(string(data), templateMarker) {
+			if _, statErr := os.Stat(backup); statErr == nil {
+				if copyErr := copyFile(backup, cfgPath); copyErr == nil {
+					fmt.Fprintf(os.Stderr, "♻️  config.ini 是模板，已从 config.ini.bak 恢复\n")
+				}
+			}
+		}
+		return
+	}
+
+	if os.IsNotExist(err) {
+		if _, statErr := os.Stat(backup); statErr == nil {
+			if copyErr := copyFile(backup, cfgPath); copyErr == nil {
+				fmt.Fprintf(os.Stderr, "♻️  未找到 config.ini，已从 config.ini.bak 恢复\n")
+			}
+		}
+	}
+}
+
+// backupConfig 发送成功后备份配置：
+//   - 模板配置不备份（避免把 your_email@qq.com 覆盖掉真备份）
+//   - 内容与已有 .bak 相同则不写盘（保护闪存）
+func backupConfig(cfgPath string) {
+	src, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return
+	}
+	if strings.Contains(string(src), templateMarker) {
+		return
+	}
+	backup := cfgPath + configBackupSuffix
+	if dst, err := os.ReadFile(backup); err == nil && bytes.Equal(src, dst) {
+		return
+	}
+	_ = os.WriteFile(backup, src, 0o600)
+}
+
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0o600)
 }
 
 // loadConfig 解析极简 INI：支持 [section]、key = value、# 和 ; 注释。
@@ -938,6 +998,9 @@ func main() {
 		return
 	}
 
+	// 覆盖插件时可能把模板 config.ini 一起拷回来，这里先自动恢复
+	resolveConfig(*cfgPath)
+
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
 		fail("%v", err)
@@ -1036,6 +1099,9 @@ func main() {
 		cleanup()
 		os.Exit(2)
 	}
+
+	// 发送成功后才备份配置（模板不备份、内容没变不写盘）
+	backupConfig(*cfgPath)
 
 	if isCard {
 		fmt.Printf("✅ 已发送大文件 HTML 试读名片: %s -> %s\n", cardTitle, cfg.to)

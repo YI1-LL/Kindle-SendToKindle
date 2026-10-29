@@ -1,10 +1,11 @@
 #!/bin/sh
-# cancel.sh —— 取消大文件发送：清掉 pending，菜单回到普通书籍列表
-# 由 KUAL 菜单项「[x] 取消发送 (返回选书)」调用，不需要 chmod
+# bin/cancel.sh - SendToKindle v1.5.0
+# 取消大文件发送：删掉 pending，提示后回到书目列表
+# 屏幕：FBInk 三行居中，不清屏、不退出 KUAL
 
-PLUGIN_DIR="/mnt/us/extensions/SendToKindle"
-LOG="$PLUGIN_DIR/send.log"
-PENDING="/tmp/stk_pending.txt"
+DIR=$(cd "$(dirname "$0")/.." && pwd)
+PENDING="$DIR/pending"
+LOG="$DIR/send.log"
 
 FBINK=""
 for d in /var/tmp /mnt/us/libkh/bin /mnt/us/koreader /mnt/us/linkss/bin /mnt/us/linkfonts/bin /mnt/us/usbnet/bin /usr/bin /usr/local/bin; do
@@ -22,18 +23,12 @@ for c in /usr/sbin/eips /usr/bin/eips /bin/eips /sbin/eips; do
     fi
 done
 
-log() {
-    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null
-}
-
-draw_card() {
+show_msg() {
     if [ -n "$FBINK" ]; then
         "$FBINK" -qpmM -y 0 "$1
 $2
 $3" >/dev/null 2>&1
-        rc=$?
-        log "fbink rc=$rc"
-        if [ "$rc" -ne 0 ]; then
+        if [ $? -ne 0 ]; then
             "$FBINK" -qpm -y -5 "$1" >/dev/null 2>&1
         fi
     elif [ -n "$EIPS" ]; then
@@ -41,12 +36,15 @@ $3" >/dev/null 2>&1
     fi
 }
 
-target=$(head -n 1 "$PENDING" 2>/dev/null)
-log "---- cancel: ${target:-<empty>}"
+log() {
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null
+}
 
+_target=$(head -n 1 "$PENDING" 2>/dev/null)
 rm -f "$PENDING"
+log "cancel: ${_target:-<empty>}"
 
-draw_card "CANCELED" "nothing was sent" "book kept on device"
+show_msg "[ -- ] CANCELED" "Back to book list" ""
 
-sh "$PLUGIN_DIR/bin/scan.sh" -q >/dev/null 2>&1
+sh "$DIR/bin/scan.sh" -q >/dev/null 2>&1
 exit 0

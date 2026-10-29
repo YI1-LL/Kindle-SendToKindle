@@ -3,8 +3,7 @@
     {
       "name": "Send to Kindle",
       "items": [
-        {"name": "[1] 刷新书目 (首次使用先点我)", "action": "sh /mnt/us/extensions/SendToKindle/bin/scan.sh", "exitmenu": true},
-        {"name": "[3] 选书发送 (点 [1] 刷新后才有书)", "items": []}
+        {"name": "[1] 刷新书目 (首次使用先点我)", "action": "sh /mnt/us/extensions/SendToKindle/bin/scan.sh", "exitmenu": true}
       ]
     }
   ]
